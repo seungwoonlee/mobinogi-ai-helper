@@ -52,7 +52,7 @@ def _strip_invisible(text: str) -> str:
 def judge_input(line: str) -> InputJudgment:
     """한 줄 입력이 게임 채팅인지, 거부인지, 일반 대화인지 판정한다."""
     # 1. 개행은 정규화·제거보다 먼저 거부한다.
-    if "\n" in line or "\r" in line:
+    if any(mark in line for mark in ("\n", "\r", "\x0b", "\x0c", "\x85", "\u2028", "\u2029")):
         if _normalize(line).lstrip().startswith(PREFIX):
             return InputJudgment(REJECTED, reason=REASON_MULTILINE)
         return InputJudgment(NOT_CHAT)

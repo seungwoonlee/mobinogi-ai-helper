@@ -56,6 +56,28 @@ def _allowed_argv(argv) -> bool:
     return False
 
 
+def _split_cmdline(cmdline) -> list:
+    """Windows 명령줄을 인자 목록으로 푼다(CommandLineToArgvW). 풀 수 없으면 빈 목록(거부)."""
+    if not isinstance(cmdline, str) or not cmdline:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        shell32 = ctypes.windll.shell32
+        shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+        count = ctypes.c_int(0)
+        argv = shell32.CommandLineToArgvW(cmdline, ctypes.byref(count))
+        if not argv:
+            return []
+        try:
+            return [argv[i] for i in range(count.value)]
+        finally:
+            ctypes.windll.kernel32.LocalFree(argv)
+    except Exception:  # noqa: BLE001 - 풀 수 없으면 거부
+        return []
+
+
 _RealPopen = subprocess.Popen
 
 
@@ -70,6 +92,8 @@ class _GuardedPopen(_RealPopen):
 
 def _install() -> None:
     subprocess.Popen = _GuardedPopen  # type: ignore[misc]
+    # 사전 차단선: 테스트 안에서는 CLI 환경 변수가 항상 모의 CLI를 가리킨다(실제 경로로 넘어가지 않는다).
+    os.environ["MABINOGI_MOBILE_CLI"] = str(FAKE_CLI)
 
     def deny(name):
         def guarded(*a, **k):
@@ -86,8 +110,8 @@ def _install() -> None:
         real_create = _winapi.CreateProcess
 
         def create_process(app, cmdline, *a, **k):
-            text = (cmdline or "") if isinstance(cmdline, str) else ""
-            if str(FAKE_CLI) not in text and "taskkill" not in text.lower():
+            # 명령줄을 인자 목록으로 풀어 Popen과 같은 허용 규칙을 그대로 적용한다.
+            if not _allowed_argv(_split_cmdline(cmdline)):
                 _violate("_winapi.CreateProcess")
             return real_create(app, cmdline, *a, **k)
 

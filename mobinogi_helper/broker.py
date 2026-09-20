@@ -46,6 +46,7 @@ class QueryResult:
 class SendRun:
     busy: bool
     raw: Optional[RawResult] = None
+    reason: Reason = Reason.NONE
 
 
 Observer = Callable[[CommandState, CommandState, Reason], None]
@@ -65,6 +66,7 @@ class CommandBroker:
         # [가정] 캐릭터 미접속 응답의 형식은 미확인이다(02 §18). 판정 함수를 주입한다.
         self._session_absent = session_absent
         self._lock = threading.Lock()
+        self._gen_lock = threading.Lock()
         self._state = CommandState.IDLE
         self._generation = 0
         self._observers: list = []
@@ -79,8 +81,9 @@ class CommandBroker:
 
     def bump_generation(self) -> int:
         """절전 복귀·재연결 등에서 3단계 감독기가 호출한다. 이전 세대의 QUERY 응답은 폐기된다."""
-        self._generation += 1
-        return self._generation
+        with self._gen_lock:
+            self._generation += 1
+            return self._generation
 
     def add_observer(self, observer: Observer) -> None:
         self._observers.append(observer)
@@ -88,7 +91,10 @@ class CommandBroker:
     def _transition(self, new: CommandState, reason: Reason = Reason.NONE) -> None:
         previous, self._state = self._state, new
         for observer in list(self._observers):
-            observer(previous, new, reason)
+            try:
+                observer(previous, new, reason)
+            except Exception:  # noqa: BLE001 - 관찰자 오류가 실행 결과를 잃게 하지 않는다
+                pass
 
     def _acquire(self, wait_ms: int) -> bool:
         return self._lock.acquire(timeout=max(wait_ms, 0) / 1000.0)
@@ -105,12 +111,16 @@ class CommandBroker:
             self._transition(CommandState.IDLE, result.reason)
             return result
         finally:
+            self._state = CommandState.IDLE  # 예외가 나도 RUNNING에 고착되지 않는다
             self._lock.release()
 
     def _classify_query(self, command: str, raw: RawResult, generation: int, request_id: str) -> QueryResult:
         def failed(reason: Reason) -> QueryResult:
             return QueryResult(QueryKind.FAILED, reason, generation, request_id)
 
+        # 오래된 세대의 응답은 성공·실패를 가리지 않고 폐기한다(02 §5 세대 번호 규칙).
+        if generation != self._generation:
+            return QueryResult(QueryKind.STALE, Reason.STALE_GENERATION, generation, request_id)
         if raw.failure == Failure.TIMEOUT:
             return failed(Reason.TIMEOUT)
         if raw.failure == Failure.INTERRUPTED:
@@ -129,8 +139,6 @@ class CommandBroker:
             return failed(parsed.reason)
         if self._session_absent is not None and self._session_absent(parsed.data):
             return failed(Reason.SESSION_ABSENT)
-        if generation != self._generation:
-            return QueryResult(QueryKind.STALE, Reason.STALE_GENERATION, generation, request_id)
         return QueryResult(QueryKind.OK, Reason.NONE, generation, request_id, data=parsed.data)
 
     def run_send(
@@ -140,8 +148,13 @@ class CommandBroker:
         wait_ms: int = 0,
         before: Optional[Callable[[], None]] = None,
         timeout: Optional[float] = None,
+        evaluate: Optional[Callable[[RawResult], Reason]] = None,
     ) -> SendRun:
-        """채팅·행동 전송. `before`는 잠금을 잡은 뒤 프로세스를 시작하기 전에 호출된다(write-ahead)."""
+        """채팅·행동 전송. `before`는 잠금을 잡은 뒤 프로세스를 시작하기 전에 호출된다(write-ahead).
+
+        `evaluate`는 호출자가 결과를 판정해 사유를 돌려주는 콜백이다(브로커는 채팅 의미를 모른다).
+        사유가 `NONE`이 아니면 관찰자는 `FAILED` → `IDLE` 전이를 사유와 함께 받는다(02 C16·C17).
+        """
         if not self._acquire(wait_ms):
             return SendRun(busy=True)
         try:
@@ -149,7 +162,16 @@ class CommandBroker:
                 before()  # 예외가 나면 전송하지 않는다
             self._transition(CommandState.RUNNING_SEND)
             raw = self._adapter.run(command, args, timeout=self._send_timeout if timeout is None else timeout)
-            self._transition(CommandState.IDLE)
-            return SendRun(busy=False, raw=raw)
+            reason = Reason.NONE
+            if evaluate is not None:
+                try:
+                    reason = evaluate(raw)
+                except Exception:  # noqa: BLE001 - 판정 콜백 오류가 결과를 잃게 하지 않는다
+                    reason = Reason.NONE
+            if reason != Reason.NONE:
+                self._transition(CommandState.FAILED, reason)
+            self._transition(CommandState.IDLE, reason)
+            return SendRun(busy=False, raw=raw, reason=reason)
         finally:
+            self._state = CommandState.IDLE  # 예외가 나도 RUNNING에 고착되지 않는다
             self._lock.release()

@@ -82,6 +82,7 @@ class ChatService:
         self._wall = wall
         self._window = duplicate_window
         self._recent: dict = {}  # 메모리 해시 → 등록 시각(프로세스 안에서만 유효)
+        self._pending_store_warning = False
 
     # ---- 재전송 확인 ---------------------------------------------------
     def plan_for(self, judgment: InputJudgment, origin: Origin) -> ChatPlan:
@@ -156,6 +157,7 @@ class ChatService:
             steps=[Step("chat")],
         )
 
+        self._pending_store_warning = False
         chat_verdict, busy, store_failed = self._run_step(context, "chat", plan.text, wait_ms=0)
         if busy:
             return ChatResult(ChatStatus.BUSY, context_id=None)
@@ -169,7 +171,7 @@ class ChatService:
             self._recent[_digest(plan.text)] = self._clock()
 
         behaviour_verdict: Optional[SendVerdict] = None
-        store_warning = False
+        store_warning = self._pending_store_warning
         if chat_verdict.kind == VerdictKind.SENT and plan.behaviour:
             context.steps.append(Step("behaviour"))
             behaviour_verdict, busy_b, failed_b = self._run_step(
@@ -189,6 +191,7 @@ class ChatService:
         outcome, resend = self._outcome(chat_verdict, plan, behaviour_verdict, behaviour_attempted)
         context.outcome = outcome
         context.behaviour_resend_allowed = resend
+        store_warning = store_warning or self._pending_store_warning
         context.ended_at = self._wall()
         try:
             self._store.save(context)
@@ -215,27 +218,41 @@ class ChatService:
             context.started_at = self._wall()
 
         def before() -> None:
+            # 행동 재전송 중에는 pending 기록과 함께 재전송 허용을 내린다(도중에 죽어도 중복을 허용하지 않는다).
+            if name == "behaviour":
+                context.behaviour_resend_allowed = False
             self._store.save(context)  # 전송 직전에 pending 기록. 실패하면 전송하지 않는다.
 
-        store_failed = False
+        captured: dict = {}
+
+        def evaluate(raw) -> Reason:
+            verdict = judge_write_chat(raw, self._known)
+            captured["verdict"] = verdict
+            return Reason.NONE if verdict.kind == VerdictKind.SENT else verdict.reason
+
         try:
-            run = self._broker.run_send("write_chat", [_payload(text)], wait_ms=wait_ms, before=before)
+            run = self._broker.run_send(
+                "write_chat", [_payload(text)], wait_ms=wait_ms, before=before, evaluate=evaluate
+            )
         except StoreError:
             return None, False, True
         if run.busy:
             return None, True, False
         assert run.raw is not None
-        verdict = judge_write_chat(run.raw, self._known)
+        verdict = captured["verdict"]
         step.state = {
             VerdictKind.SENT: StepState.SENT,
             VerdictKind.NOT_SENT: StepState.FAILED,
             VerdictKind.UNKNOWN: StepState.UNKNOWN,
         }[verdict.kind]
+        if name == "chat" and verdict.kind == VerdictKind.UNKNOWN:
+            # 결과 저장 직전에 죽어도 확인하지 않은 UNRESOLVED로 남도록 결과를 함께 기록한다.
+            context.outcome = Outcome.UNRESOLVED
         try:
             self._store.save(context)
         except StoreError:
-            store_failed = False  # 이미 전송했으므로 결과만 보고한다(호출자가 store_warning을 본다)
-        return verdict, False, store_failed
+            self._pending_store_warning = True  # 이미 전송했으므로 결과만 보고한다
+        return verdict, False, False
 
     @staticmethod
     def _outcome(chat: SendVerdict, plan: ChatPlan, behaviour: Optional[SendVerdict], attempted: bool):

@@ -149,6 +149,40 @@ def process_start_time(pid: int) -> Optional[int]:
         return None
 
 
+def _windows_owner_state(pid: int, start: Optional[int]) -> OwnerState:
+    """Windows: 프로세스 없음(ERROR_INVALID_PARAMETER)은 죽음, 접근 불가는 판정 불가로 구분한다."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:  # ERROR_INVALID_PARAMETER: 해당 PID의 프로세스가 없다
+                return OwnerState.DEAD
+            return OwnerState.UNKNOWN  # 접근 거부 등
+        try:
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259:  # STILL_ACTIVE
+                return OwnerState.DEAD
+            creation = wintypes.FILETIME()
+            unused = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle, ctypes.byref(creation), ctypes.byref(unused), ctypes.byref(unused), ctypes.byref(unused)
+            ):
+                return OwnerState.UNKNOWN
+            current = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            if start is None:
+                return OwnerState.UNKNOWN  # 시작 시각이 없으면 PID 재사용을 배제할 수 없다
+            return OwnerState.ALIVE if current == start else OwnerState.DEAD  # 다르면 PID가 재사용됨
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - 판정 불가로 처리
+        return OwnerState.UNKNOWN
+
+
 def owner_state(pid: int, start: Optional[int]) -> OwnerState:
     """소유 프로세스의 생사를 판정한다. 알 수 없으면 UNKNOWN(기록을 바꾸지 않는다)."""
     if pid <= 0:
@@ -156,12 +190,7 @@ def owner_state(pid: int, start: Optional[int]) -> OwnerState:
     if pid == os.getpid():
         return OwnerState.ALIVE
     if os.name == "nt":
-        current = process_start_time(pid)
-        if current is None:
-            return OwnerState.UNKNOWN
-        if start is not None and current != start:
-            return OwnerState.DEAD  # PID가 다른 프로세스에 재사용됨
-        return OwnerState.ALIVE
+        return _windows_owner_state(pid, start)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -211,7 +240,9 @@ class ActionStore:
             try:
                 with open(path, "r", encoding="utf-8") as handle:
                     context = ActionContext.from_dict(json.load(handle))
-            except (OSError, ValueError, KeyError, TypeError):
+            except OSError:
+                continue  # 다른 프로세스가 쓰는 중일 수 있다: 옮기지 않고 다음에 다시 읽는다
+            except (ValueError, KeyError, TypeError):
                 bad = True
             if bad:
                 try:
@@ -251,7 +282,7 @@ class ActionStore:
         closed = 0
         undetermined = 0
         for context in self.load_all():
-            if context.outcome is not None or not context.has_pending():
+            if not context.has_pending():
                 continue
             state = self._owner_probe(context.owner_pid, context.owner_start)
             if state == OwnerState.ALIVE:
@@ -262,7 +293,9 @@ class ActionStore:
             for step in context.steps:
                 if step.state == StepState.PENDING:
                     step.state = StepState.UNKNOWN
-            context.outcome = Outcome.UNRESOLVED
+            if context.outcome is None:
+                context.outcome = Outcome.UNRESOLVED
+            context.behaviour_resend_allowed = False  # 이미 나갔을 수 있어 재전송을 허용하지 않는다
             context.ended_at = time.time()
             self.save(context)
             closed += 1
@@ -271,7 +304,7 @@ class ActionStore:
     def has_undetermined_pending(self) -> bool:
         """판정 불가 소유자의 미완료 기록이 있는지(질문 2 조건에 포함)."""
         for context in self.load_all():
-            if context.outcome is None and context.has_pending():
+            if context.has_pending():
                 if self._owner_probe(context.owner_pid, context.owner_start) == OwnerState.UNKNOWN:
                     return True
         return False

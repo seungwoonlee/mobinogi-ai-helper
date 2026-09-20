@@ -96,6 +96,10 @@ def judge_write_chat(raw: RawResult, known: KnownResponses) -> SendVerdict:
 
     parsed = parse_object(raw)
     if not parsed.ok:
+        if raw.exit_code == 5:
+            return SendVerdict(VerdictKind.UNKNOWN, Reason.CODE_5)
+        if raw.exit_code not in (0, None):
+            return SendVerdict(VerdictKind.UNKNOWN, Reason.PROCESS_EXIT)
         return SendVerdict(VerdictKind.UNKNOWN, parsed.reason)
     data = parsed.data
 
@@ -104,6 +108,7 @@ def judge_write_chat(raw: RawResult, known: KnownResponses) -> SendVerdict:
         return SendVerdict(VerdictKind.UNKNOWN, Reason.NOT_STRING_STATUS)
 
     retry_after = find_marker(data, "retryAfterSeconds")
+    retry_present = retry_after is not None
     retry_value = float(retry_after) if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) else None
 
     if known.config_verified:
@@ -111,8 +116,8 @@ def judge_write_chat(raw: RawResult, known: KnownResponses) -> SendVerdict:
             return SendVerdict(VerdictKind.NOT_SENT, Reason.REJECTED, status, retry_value)
 
     has_marker = (
-        find_marker(data, "error") not in (None, "", False)
-        or retry_after is not None
+        find_marker(data, "error") is not None
+        or retry_present
         or status in _NOT_SUCCESS_STATUSES
     )
     if known.config_verified and status in known.sent_statuses and raw.exit_code == 0 and not has_marker:
@@ -120,6 +125,8 @@ def judge_write_chat(raw: RawResult, known: KnownResponses) -> SendVerdict:
 
     if has_marker:
         reason = Reason.NOT_SUCCESS_MARKER
+    elif raw.exit_code == 5:
+        reason = Reason.CODE_5
     elif not known.usable:
         reason = Reason.NO_KNOWN_RESPONSES
     elif raw.exit_code != 0:

@@ -19,8 +19,19 @@ CANARY = "카나리문구입니다XYZ"
 BODY_CANARY = "응답원문카나리QRS"
 
 
+SENT_TEXT = CANARY + " 😊"  # 실제 전송 문자열(정규화·이모지가 붙은 값)
+
+
 def variants(text: str) -> list:
-    """카나리의 여러 표현(문자열 변형과 바이트 변형)을 만든다."""
+    """카나리의 여러 표현(문자열 변형과 바이트 변형)을 만든다. 실제 전송 문자열의 변형도 포함한다."""
+    if text == CANARY:
+        s1, b1 = _variants(text)
+        s2, b2 = _variants(SENT_TEXT)
+        return list(set(s1) | set(s2)), list({*b1, *b2})
+    return _variants(text)
+
+
+def _variants(text: str) -> list:
     raw = text.encode("utf-8")
     std = base64.b64encode(raw).decode("ascii")
     urlsafe = base64.urlsafe_b64encode(raw).decode("ascii")
@@ -35,7 +46,8 @@ def variants(text: str) -> list:
         text[:6],
         std[:6],
     }
-    blobs = {text.encode("utf-16le"), text.encode("utf-16be"), text.encode("cp949"), raw}
+    blobs = {text.encode("utf-16le"), text.encode("utf-16be"), text.encode("cp949", errors="ignore"), raw}
+    blobs.discard(b"")
     return [s for s in strings if s], list(blobs)
 
 
@@ -43,7 +55,7 @@ class LeakTests(FakeCliTestCase):
     def _assert_clean(self, haystack: str, label: str, allow_plain: bool = False) -> None:
         strings, _ = variants(CANARY)
         for needle in strings:
-            if allow_plain and needle in (CANARY, CANARY[:6]):
+            if allow_plain and needle in (CANARY, CANARY[:6], SENT_TEXT):
                 continue
             self.assertNotIn(needle, haystack, f"{label}에 카나리({needle!r})가 남아 있어요")
         for needle in (BODY_CANARY, BODY_CANARY[:6]):
@@ -61,7 +73,10 @@ class LeakTests(FakeCliTestCase):
 
         class Capture(logging.Handler):
             def emit(self, record):
-                records.append(self.format(record) + repr(record.args) + "".join(traceback.format_exception(*record.exc_info)) if record.exc_info else self.format(record))
+                parts = [self.format(record), repr(record.args), repr(record.msg)]
+                if record.exc_info:
+                    parts.append("".join(traceback.format_exception(*record.exc_info)))
+                records.append("\n".join(parts))
 
         handler = Capture(level=logging.DEBUG)
         root = logging.getLogger()
@@ -102,6 +117,23 @@ class LeakTests(FakeCliTestCase):
         with mock.patch("subprocess.Popen", side_effect=FileNotFoundError(payload)):
             raw = self.adapter().run("write_chat", [payload], timeout=1)
         self._assert_clean(repr(raw) + str(raw.failure), "RawResult")
+
+    def test_service_path_exceptions_and_streams_stay_clean(self):
+        """서비스·브로커 경로에서 실행 실패가 나도 예외 표현·표준 출력·오류에 원문이 없어야 한다."""
+        import contextlib
+        from unittest import mock
+
+        payload = "base64:" + base64.b64encode(SENT_TEXT.encode()).decode()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("subprocess.Popen", side_effect=OSError(payload)):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                service = self.service()
+                result = service.send_chat_action(
+                    judge_input(f"@@ {CANARY}"), origin=Origin.USER_AT, provenance=Provenance.TYPED
+                )
+        text = repr(result) + str(result.chat_verdict) + out.getvalue() + err.getvalue()
+        self._assert_clean(text, "서비스 경로")
+        self._assert_clean(self.stored_text(), "저장 파일")
 
     def test_label_never_contains_chat_text(self):
         self.scenario(stdout=json.dumps({"status": "ok"}))

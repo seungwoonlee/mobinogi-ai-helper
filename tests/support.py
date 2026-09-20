@@ -37,6 +37,7 @@ class FakeCliTestCase(unittest.TestCase):
         self.scenario_path = self.tmp / "scenario.json"
         self.log_path = self.log_dir / "calls.jsonl"
         self._env = dict(os.environ)
+        os.environ["MABINOGI_MOBILE_CLI"] = str(FAKE_CLI)
         os.environ["FAKE_CLI_SCENARIO"] = str(self.scenario_path)
         os.environ["FAKE_CLI_LOG"] = str(self.log_path)
         os.environ["MOBINOGI_STORE_DIR"] = str(self.store_dir)
@@ -67,6 +68,17 @@ class FakeCliTestCase(unittest.TestCase):
 
     def service(self, known=KNOWN_FIXTURE, broker=None, store=None, **kwargs) -> ChatService:
         return ChatService(broker or self.broker(send_timeout=5.0), store or self.store(), known, **kwargs)
+
+    def wait_for_calls(self, count: int = 1, seconds: float = 15.0) -> None:
+        """모의 CLI가 시작해 호출을 기록할 때까지 기다린다(고정 sleep 대신)."""
+        import time
+
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if len(self.calls()) >= count:
+                return
+            time.sleep(0.02)
+        self.fail("모의 CLI가 시간 안에 시작되지 않았어요")
 
     def calls(self) -> list:
         if not self.log_path.is_file():

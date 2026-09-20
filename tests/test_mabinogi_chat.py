@@ -126,6 +126,31 @@ class MainTests(FakeCliTestCase):
         self.assertEqual(self.calls(), [])
 
 
+class BuildToolTests(FakeCliTestCase):
+    def test_corrupt_known_responses_warns_and_everything_stays_unresolved(self):
+        import os
+
+        bad = self.tmp / "known.json"
+        bad.write_text("{", encoding="utf-8")
+        os.environ["MOBINOGI_KNOWN_RESPONSES"] = str(bad)
+        self.scenario(stdout=SENT)
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", new=stderr):
+            tool = mabinogi_chat.build_tool()
+        self.assertIsNotNone(tool)
+        self.assertIn("확인 불가", stderr.getvalue())
+        tool._out = io.StringIO()
+        tool._ask = Answers("y")
+        self.assertEqual(tool.handle_line("@@ 길드챗 테스트"), 3)
+
+    def test_keyboard_interrupt_at_the_prompt_exits_cleanly(self):
+        self.scenario(stdout=SENT)
+        tool = Tool(self.service(), ask=Answers(), out=io.StringIO())
+        with mock.patch("builtins.input", side_effect=KeyboardInterrupt):
+            self.assertEqual(tool.run_interactive(), 0)
+        self.assertEqual(self.calls(), [])
+
+
 class SafePrintTests(unittest.TestCase):
     def test_cp949_stream_does_not_raise_on_emoji(self):
         raw = io.BytesIO()

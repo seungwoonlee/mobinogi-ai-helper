@@ -36,11 +36,15 @@ def main() -> int:
         scenario = calls[min(index, len(calls) - 1)]
 
     if scenario.get("spawn_grandchild"):
-        subprocess.Popen(
+        child = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             stdout=sys.stdout,
             stderr=sys.stderr,
         )
+        pid_file = os.environ.get("FAKE_CLI_GRANDCHILD")
+        if pid_file:
+            with open(pid_file, "w", encoding="utf-8") as handle:
+                handle.write(str(child.pid))
 
     delay = float(scenario.get("delay", 0))
     if delay:

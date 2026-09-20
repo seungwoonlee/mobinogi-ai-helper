@@ -85,7 +85,7 @@ class BrokerQueryTests(FakeCliTestCase):
         holder = {}
         thread = threading.Thread(target=lambda: holder.setdefault("r", broker.run_query("status")))
         thread.start()
-        time.sleep(0.2)
+        self.wait_for_calls(1)  # 모의 CLI가 시작한 것을 확인한 뒤 세대를 올린다
         broker.bump_generation()
         thread.join()
         self.assertEqual(holder["r"].kind, QueryKind.STALE)
@@ -102,11 +102,12 @@ class BrokerQueryTests(FakeCliTestCase):
     def test_T19_reentry_returns_busy_without_second_process(self):
         self.scenario(delay=0.6, stdout=SENT)
         broker = self.broker(send_timeout=5)
-        threading.Thread(target=lambda: broker.run_send("write_chat", ["base64:QQ=="])).start()
-        time.sleep(0.2)
+        first = threading.Thread(target=lambda: broker.run_send("write_chat", ["base64:QQ=="]))
+        first.start()
+        self.wait_for_calls(1)
         second = broker.run_send("write_chat", ["base64:QQ=="], wait_ms=0)
         self.assertTrue(second.busy)
-        time.sleep(0.8)
+        first.join()
         self.assertEqual(len(self.calls()), 1)
 
 
@@ -267,7 +268,7 @@ class ChatServiceTests(FakeCliTestCase):
         service = self.service()
         thread = threading.Thread(target=lambda: user_typed(service, "@@ 안녕하세요"))
         thread.start()
-        time.sleep(0.25)
+        self.wait_for_calls(1)  # 프로세스가 이미 시작된 시점에 pending 기록이 있어야 한다
         contexts = self.store().load_all()
         thread.join()
         self.assertEqual(len(contexts), 1)
@@ -288,6 +289,66 @@ class ChatServiceTests(FakeCliTestCase):
             self.service().send_chat_action(judge_input("안녕"), origin=Origin.USER_AT, provenance=Provenance.TYPED).status,
             ChatStatus.INVALID_INPUT,
         )
+
+
+class ChatPathInjectionTests(FakeCliTestCase):
+    """계획 §5-1의 오류 주입을 채팅 경로에서 시험한다. 어떤 경우에도 성공을 추측하지 않고 행동은 실행되지 않는다."""
+
+    def _run(self, scenario, known=KNOWN_FIXTURE):
+        self.scenario(**scenario)
+        self.log_path.unlink(missing_ok=True)
+        # 앞선 시험이 남긴 미확인 UNRESOLVED가 재전송 확인을 요구하므로 확인 처리(문답 뒤)한 상태로 실행한다.
+        return user_typed(self.service(known=known), "@@ 고마워요", duplicate_confirmed=True)
+
+    def test_exit_codes_2_3_4_5_with_and_without_body_are_unknown(self):
+        for code in (2, 3, 4, 5):
+            for stdout in ("", json.dumps({"status": "ok"}), json.dumps({"error": "game_off"})):
+                with self.subTest(code=code, stdout=stdout):
+                    result = self._run({"exit_code": code, "stdout": stdout})
+                    self.assertEqual(result.outcome, Outcome.UNRESOLVED)
+                    self.assertEqual(len(self.calls()), 1)
+
+    def test_empty_stdout_with_exit_zero_is_unknown(self):
+        result = self._run({"exit_code": 0, "stdout": ""})
+        self.assertEqual((result.outcome, result.reason), (Outcome.UNRESOLVED, Reason.EMPTY_RESPONSE))
+
+    def test_invalid_utf8_and_cp949_bodies_are_unknown(self):
+        for hexed in ("fffe7b7d", '{"status": "한글"}'.encode("cp949").hex()):
+            with self.subTest(hexed=hexed):
+                result = self._run({"raw_stdout_hex": hexed})
+                self.assertEqual(result.outcome, Outcome.UNRESOLVED)
+
+    def test_large_output_under_and_over_limit(self):
+        under = self._run({"stdout": SENT, "huge_output": 1000})
+        self.assertNotEqual(under.reason, Reason.OUTPUT_TOO_LARGE)
+        self.scenario(stdout=SENT, huge_output=2_000_000)
+        self.log_path.unlink(missing_ok=True)
+        result = user_typed(self.service(broker=self.broker(send_timeout=5)), "@@ 고마워요", duplicate_confirmed=True)
+        self.assertEqual((result.outcome, result.reason), (Outcome.UNRESOLVED, Reason.OUTPUT_TOO_LARGE))
+
+    def test_delayed_exit_after_response_is_still_judged(self):
+        result = self._run({"stdout": SENT, "delay": 0.2})
+        self.assertEqual(result.outcome, Outcome.COMPLETED)
+
+    def test_keyboard_interrupt_during_send_is_unresolved_and_skips_behaviour(self):
+        from unittest import mock
+
+        self.scenario(delay=5, stdout=SENT)
+        calls = {"n": 0}
+        real_sleep = time.sleep
+
+        def interrupting(seconds):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise KeyboardInterrupt
+            real_sleep(seconds)
+
+        service = self.service(broker=self.broker(send_timeout=10))
+        with mock.patch("mobinogi_helper.cli_adapter.time.sleep", interrupting):
+            result = user_typed(service, "@@ 고마워요")
+        self.assertEqual((result.outcome, result.reason), (Outcome.UNRESOLVED, Reason.USER_INTERRUPT))
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.store().load_all()[0].steps[0].state, StepState.UNKNOWN)
 
 
 class FuzzTests(FakeCliTestCase):

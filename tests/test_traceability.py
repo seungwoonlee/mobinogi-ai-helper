@@ -13,6 +13,18 @@ REQUIRED = (
 )
 
 
+def _is_meaningful_assert(node) -> bool:
+    """의미 있는 단언: 상수만 비교하는 assertTrue(True) 같은 형식적 단언은 세지 않는다."""
+    if isinstance(node, ast.Assert):
+        return not isinstance(node.test, ast.Constant)
+    if isinstance(node, ast.Call) and getattr(node.func, "attr", "").startswith("assert"):
+        name = getattr(node.func, "attr", "")
+        if name in {"assertTrue", "assertFalse"} and node.args and isinstance(node.args[0], ast.Constant):
+            return False
+        return bool(node.args) or bool(node.keywords)
+    return False
+
+
 def _tagged_functions():
     found = {}
     for path in sorted(Path(__file__).parent.glob("test_*.py")):
@@ -26,11 +38,7 @@ def _tagged_functions():
                     ids += [arg.value for arg in decorator.args if isinstance(arg, ast.Constant)]
             if not ids:
                 continue
-            has_assert = any(
-                (isinstance(inner, ast.Call) and getattr(inner.func, "attr", "").startswith("assert"))
-                or isinstance(inner, ast.Assert)
-                for inner in ast.walk(node)
-            )
+            has_assert = any(_is_meaningful_assert(inner) for inner in ast.walk(node))
             for scenario_id in ids:
                 found.setdefault(scenario_id, []).append((f"{path.name}::{node.name}", has_assert))
     return found
@@ -43,6 +51,11 @@ class TraceabilityTests(unittest.TestCase):
         self.assertEqual(missing, [], f"태그된 테스트가 없는 시나리오: {missing}")
         without_assert = [sid for sid in REQUIRED if not any(ok for _, ok in found[sid])]
         self.assertEqual(without_assert, [], f"단언이 없는 시나리오: {without_assert}")
+
+    def test_tags_only_live_on_test_methods(self):
+        for scenario_id, entries in _tagged_functions().items():
+            for name, _ in entries:
+                self.assertIn("::test", name, f"{scenario_id}: 테스트 함수가 아닌 곳에 태그가 있어요 ({name})")
 
     def test_production_code_has_no_broad_baseexception_handlers(self):
         """위반을 삼킬 수 있는 except BaseException·bare except를 프로덕션 코드에 두지 않는다."""

@@ -125,7 +125,7 @@ class CliAdapter:
         def pump(stream, key: str) -> None:
             try:
                 while True:
-                    chunk = stream.read(4096)
+                    chunk = stream.read1(4096)  # 가용한 만큼만 읽는다(read(n)은 n바이트나 EOF까지 막힌다)
                     if not chunk:
                         break
                     buffers[key].extend(chunk)
@@ -165,7 +165,11 @@ class CliAdapter:
             self._kill_tree(proc)
         for thread in threads:
             thread.join(_JOIN_SECONDS)
-        for stream in (proc.stdout, proc.stderr):
+        # 읽기 스레드가 아직 파이프에서 막혀 있으면(손자 프로세스가 파이프를 쥔 경우) close가 함께 막히므로
+        # 닫지 않고 데몬 스레드를 버린다. 그때까지 받은 출력으로 판정한다.
+        for stream, thread in ((proc.stdout, threads[0]), (proc.stderr, threads[1])):
+            if thread.is_alive():
+                continue
             try:
                 stream.close()
             except OSError:

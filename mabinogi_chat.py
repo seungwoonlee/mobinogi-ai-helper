@@ -181,9 +181,23 @@ class Tool:
 
 def _stdin_is_terminal() -> bool:
     try:
-        return sys.stdin.isatty()
+        if not sys.stdin.isatty():
+            return False
     except (AttributeError, ValueError):
         return False
+    if sys.platform == "win32":
+        # NUL 같은 문자 장치도 isatty가 참일 수 있어 콘솔 모드를 직접 확인한다.
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+            mode = wintypes.DWORD()
+            return bool(kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
+        except Exception:  # noqa: BLE001 - 확인할 수 없으면 거부한다
+            return False
+    return True
 
 
 def build_tool() -> Optional[Tool]:

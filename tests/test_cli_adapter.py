@@ -90,11 +90,47 @@ class CliAdapterTests(FakeCliTestCase):
         self.assertEqual(raw.stdout, "")
         self.assertEqual(raw.stderr, "boom")
 
-    def test_grandchild_holding_pipe_does_not_hang(self):
+    def test_grandchild_holding_pipe_does_not_hang_and_is_killed(self):
+        import os
+        import time
+        from mobinogi_helper.action_context import process_start_time
+
+        pid_file = self.tmp / "grandchild.pid"
+        os.environ["FAKE_CLI_GRANDCHILD"] = str(pid_file)
         self.scenario(spawn_grandchild=True, stdout="{}", delay=5)
-        raw = self.adapter().run("status", timeout=0.5)
+        raw = self.adapter().run("status", timeout=1.5)
         self.assertEqual(raw.failure, Failure.TIMEOUT)
         self.assertLess(raw.duration, 20)
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 10
+        alive = True
+        while time.monotonic() < deadline:
+            if os.name != "nt" or process_start_time(pid) is None:
+                alive = False
+                break
+            time.sleep(0.1)
+        if os.name == "nt":
+            self.assertFalse(alive, "손자 프로세스가 정리되지 않았어요")
+
+    def test_keyboard_interrupt_is_reported_as_interrupted(self):
+        self.scenario(delay=5, stdout="{}")
+        calls = {"n": 0}
+        real_sleep = __import__("time").sleep
+
+        def interrupting_sleep(seconds):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise KeyboardInterrupt
+            real_sleep(seconds)
+
+        with mock.patch("mobinogi_helper.cli_adapter.time.sleep", interrupting_sleep):
+            raw = self.adapter().run("status", timeout=10)
+        self.assertEqual(raw.failure, Failure.INTERRUPTED)
+
+    def test_cp949_child_output_is_not_a_crash(self):
+        self.scenario(raw_stdout_hex='{"status": "한글"}'.encode("cp949").hex())
+        raw = self.adapter().run("status", timeout=10)
+        self.assertIsNone(raw.failure)  # 복호화 실패는 치환되고 판정은 JSON 오류·불명으로 이어진다
 
     def test_missing_executable_is_launch_failure_without_argv(self):
         adapter = CliAdapter(Path(sys.executable).with_name("no-such-cli.exe"))
@@ -118,7 +154,35 @@ class CliAdapterTests(FakeCliTestCase):
         self.assertEqual(raw.failure, Failure.INTERRUPTED)
 
 
+class EnvironmentGuardTests(FakeCliTestCase):
+    def test_cli_env_var_is_pinned_to_fake_cli(self):
+        self.assertEqual(locate_cli(), FAKE_CLI)
+        self.assertEqual(adapter_for(locate_cli())._executable, Path(sys.executable))
+
+    def test_default_cli_path_is_never_selected_in_tests(self):
+        self.assertNotEqual(locate_cli(), DEFAULT_CLI_PATH)
+
+
 class GuardTests(FakeCliTestCase):
+    def test_low_level_create_process_guard(self):
+        try:
+            import _winapi  # type: ignore
+        except ImportError:
+            self.skipTest("Windows 전용")
+        from . import GuardViolation
+
+        denied = [
+            f'"{DEFAULT_CLI_PATH}" write_chat base64:AA==',
+            f'cmd.exe /c "{FAKE_CLI}"',  # 허용 경로 문자열이 들어 있어도 실행 파일이 다르면 거부
+            r"C:\Windows\System32	askkill.exe /IM MabinogiMobile_CLI.exe /F",
+            r"C:\Windows\System32	askkill.exe /PID 4 /T /F",  # 등록되지 않은 PID
+        ]
+        for command in denied:
+            with self.subTest(command=command):
+                with self.assertRaises(GuardViolation):
+                    _winapi.CreateProcess(None, command, None, None, False, 0, None, None, None)
+                acknowledge_violations(1)
+
     def test_guard_blocks_real_cli_and_counts(self):
         from . import GuardViolation
         import subprocess

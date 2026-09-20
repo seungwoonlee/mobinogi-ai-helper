@@ -80,13 +80,22 @@ def validate_query(command: str, raw: RawResult) -> Parsed:
     return validator(raw)
 
 
-def find_marker(data: Any, key: str) -> Optional[Any]:
-    """최상위 또는 body 안의 필드를 찾는다."""
+def find_markers(data: Any, key: str) -> list:
+    """최상위와 body 안의 필드 값을 모두 모은다(한쪽이 null이어도 다른 쪽을 놓치지 않는다)."""
+    values = []
     if not isinstance(data, dict):
-        return None
+        return values
     if key in data:
-        return data[key]
+        values.append(data[key])
     body = data.get("body")
     if isinstance(body, dict) and key in body:
-        return body[key]
+        values.append(body[key])
+    return values
+
+
+def find_marker(data: Any, key: str) -> Optional[Any]:
+    """비어 있지 않은 첫 값을 돌려준다. 없으면 None."""
+    for value in find_markers(data, key):
+        if value not in (None, "", False):
+            return value
     return None
