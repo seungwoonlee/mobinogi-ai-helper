@@ -1,162 +1,219 @@
-"""게임 채팅용 최소 대화형 명령어.
+"""게임 채팅용 명령행 도구(구현 2단계: 기반 위의 얇은 껍데기).
 
-실행 후 ``@@ 보낼 문구``를 입력하면 해당 문구를 마비노기 모바일 채팅으로
-전송한다. 게임 클라이언트의 AI 에이전트 연결이 켜져 있어야 한다.
+실행 후 ``@@ 보낼 문구``를 입력하면 최종 전송 내용을 보여준 뒤 확인을 받고 게임 채팅으로 보낸다.
+이 도구는 게임의 성공 응답 형식을 아직 배우지 못해(config/known_responses.json이 비어 있음)
+모든 전송이 "확인 불가"로 안내된다. 실제로는 전달됐을 수 있으니 게임 채팅창에서 확인한다.
+
+종료 코드: 0 전송 확정, 1 예기치 않은 오류, 2 입력 거부·취소, 3 확인 불가, 4 실패(미전송 확정),
+5 일부 완료, 6 터미널이 아니라서 거부, 7 재전송 확인 미충족.
 """
 
 from __future__ import annotations
 
-import base64
-from dataclasses import dataclass
-import json
-import os
-import subprocess
 import sys
-from pathlib import Path
+from typing import Callable, Optional, TextIO
+
+from mobinogi_helper.action_context import ActionStore, Outcome, StoreError
+from mobinogi_helper.broker import CommandBroker
+from mobinogi_helper.chat_input import CHAT, NOT_CHAT, REJECTED, judge_input, parse_chat_input, reject_message
+from mobinogi_helper.chat_plan import build_chat_plan
+from mobinogi_helper.chat_service import ChatResult, ChatService, ChatStatus
+from mobinogi_helper.cli_adapter import CliNotFound, adapter_for, locate_cli
+from mobinogi_helper.origin import Origin, Provenance
+from mobinogi_helper.reasons import Reason
+from mobinogi_helper.response_judge import load_known_responses
+
+__all__ = ["Tool", "main", "parse_chat_input", "build_chat_plan", "safe_print"]
+
+Q1 = "보낼까요? [y/N] "
+Q2 = "이미 전송됐을 수 있어요. 게임 채팅창에서 확인했나요? 그래도 다시 보낼까요? [y/N] "
+
+MSG_UNKNOWN_NO_SAMPLES = (
+    "전송됐을 수 있지만 결과를 확인할 수 없어요. 이 도구는 아직 게임의 성공·거부 응답 형식을 "
+    "배우지 못했어요(표본 미확정). 게임 채팅창에서 확인해주세요. 다시 보내지 않았어요."
+)
+MSG_UNKNOWN = "전송됐는지 확인할 수 없어요. 다시 보내지 않았어요. 게임 채팅창에서 확인해주세요."
 
 
-DEFAULT_CLI_PATH = Path(r"C:\Nexon\MabinogiMobile\MabinogiMobile_CLI.exe")
-PREFIX = "@@"
-MAX_CHAT_LENGTH = 50
-EMOJI_SUFFIX_LENGTH = 2  # 공백 1자 + 단일 코드포인트 이모지 1자
-
-
-@dataclass(frozen=True)
-class ChatPlan:
-    """전송할 대사와, 의도가 뚜렷할 때만 실행할 행동."""
-
-    text: str
-    behaviour: str | None
-
-
-def build_chat_plan(message: str) -> ChatPlan:
-    """문장 의도에 맞춰 이모지를 붙이고 행동을 선택한다.
-
-    모든 대사에는 이모지를 붙인다. 행동은 뜻이 분명한 경우에만 붙여서,
-    일반적인 대사에 불필요한 제스처가 나가지 않게 한다.
-    """
-    lowered = message.lower()
-    rules = (
-        (("미안", "죄송", "사과"), "😓", "/사과1"),
-        (("축하", "ㅊㅋ"), "🥳", "/축하해"),
-        (("고마", "감사"), "😍", "/하트"),
-        (("사랑", "좋아해"), "😍", "/하트"),
-        (("안녕", "반가", "어서"), "😊", "/손인사1"),
-        (("잘 가", "잘가", "수고", "이만 갈", "이만갈"), "😉", "/손인사1"),
-        (("화이팅", "힘내", "응원"), "🥳", "/응원댄스"),
-        (("ㅋㅋ", "ㅎㅎ", "웃기", "재밌"), "🤣", "/웃기1"),
-        (("슬프", "아쉽", "흑흑"), "😢", "/울기1"),
-        (("최고", "대박", "짱", "신난"), "😎", "/최고"),
-    )
-    for keywords, emoji, behaviour in rules:
-        if any(keyword in lowered for keyword in keywords):
-            return ChatPlan(f"{message} {emoji}", behaviour)
-    return ChatPlan(f"{message} 😊", None)
-
-
-def cli_path() -> Path:
-    """환경 변수로 재정의할 수 있는 게임 CLI 경로를 반환한다."""
-    return Path(os.environ.get("MABINOGI_MOBILE_CLI", DEFAULT_CLI_PATH))
-
-
-def parse_chat_input(line: str) -> str | None:
-    """`@@ 메시지` 형식에서 메시지만 꺼낸다."""
-    stripped = line.strip()
-    if not stripped.startswith(PREFIX):
-        return None
-
-    message = stripped[len(PREFIX) :].strip()
-    if not message:
-        raise ValueError("@@ 뒤에 보낼 문구를 입력하세요.")
-    if len(message) + EMOJI_SUFFIX_LENGTH > MAX_CHAT_LENGTH:
-        raise ValueError(
-            f"자동 이모지를 포함해 채팅은 {MAX_CHAT_LENGTH}자까지 보낼 수 있습니다. "
-            f"문구는 {MAX_CHAT_LENGTH - EMOJI_SUFFIX_LENGTH}자까지 입력하세요."
-        )
-    if message.startswith(("/", "#")):
-        raise ValueError("이 도구에서는 일반 대사만 보낼 수 있습니다.")
-    return message
-
-
-def send_chat(message: str, executable: Path | None = None) -> dict:
-    """UTF-8 Base64 본문으로 채팅 또는 행동을 전송하고 JSON 결과를 돌려준다."""
-    command_cli = executable or cli_path()
-    if not command_cli.is_file():
-        raise RuntimeError(f"게임 CLI를 찾을 수 없습니다: {command_cli}")
-
-    payload = "base64:" + base64.b64encode(message.encode("utf-8")).decode("ascii")
-    result = subprocess.run(
-        [str(command_cli), "write_chat", payload],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    if result.returncode != 0:
-        detail = result.stdout.strip() or result.stderr.strip() or "알 수 없는 오류"
-        raise RuntimeError(f"게임에 연결하지 못했습니다 (종료 코드 {result.returncode}): {detail}")
-
+def safe_print(text: str, stream: Optional[TextIO] = None) -> None:
+    """출력 인코딩 때문에 예외가 나서 전송 결과가 실패로 오해되는 일이 없게 쓴다."""
+    target = stream if stream is not None else sys.stdout
     try:
-        response = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f"게임 응답을 해석할 수 없습니다: {result.stdout.strip()}") from error
-
-    body = response.get("body") if isinstance(response, dict) else None
-    error_body = body if isinstance(body, dict) else response
-    if response.get("status") in {"rejected", "invalid_body"} or error_body.get("error"):
-        detail = error_body.get("message") or error_body.get("error") or "게임이 요청을 거부했습니다."
-        raise RuntimeError(detail)
-    return response
+        target.write(text + "\n")
+    except UnicodeEncodeError:
+        encoding = getattr(target, "encoding", None) or "utf-8"
+        target.write(text.encode(encoding, "replace").decode(encoding, "replace") + "\n")
+    try:
+        target.flush()
+    except (OSError, ValueError):
+        pass
 
 
-def send_decorated_chat(message: str, executable: Path | None = None) -> ChatPlan:
-    """이모지가 붙은 대사를 보내고, 필요한 경우 이어서 행동을 실행한다."""
-    plan = build_chat_plan(message)
-    send_chat(plan.text, executable)
-    if plan.behaviour:
-        send_chat(plan.behaviour, executable)
-    return plan
+def _drain_input() -> None:
+    """붙여넣기로 남은 입력이 확인 질문의 답으로 소비되지 않도록 버퍼를 비운다(가능한 범위)."""
+    try:
+        import msvcrt  # type: ignore
+
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    except ImportError:
+        pass
 
 
-def run_interactive() -> int:
-    print("게임 채팅 도구입니다. @@ 뒤에 문구를 입력하세요. 종료: exit 또는 quit")
-    while True:
-        try:
-            line = input("> ")
-        except (EOFError, KeyboardInterrupt):
-            print("\n종료합니다.")
+def _ask_real(prompt: str) -> str:
+    _drain_input()
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""  # EOF는 취소로 처리한다
+
+
+def _is_yes(answer: str) -> bool:
+    return answer.strip() in {"y", "Y"}
+
+
+class Tool:
+    def __init__(
+        self,
+        service: ChatService,
+        *,
+        ask: Callable[[str], str] = _ask_real,
+        out: Optional[TextIO] = None,
+    ) -> None:
+        self._service = service
+        self._ask = ask
+        self._out = out
+
+    def say(self, text: str) -> None:
+        safe_print(text, self._out)
+
+    def handle_line(self, line: str) -> int:
+        judgment = judge_input(line)
+        if judgment.kind == NOT_CHAT:
+            self.say("형식: @@ 보낼 문구")
+            return 2
+        if judgment.kind == REJECTED:
+            self.say(reject_message(judgment))
+            return 2
+        assert judgment.kind == CHAT
+
+        plan = self._service.plan_for(judgment, Origin.USER_AT)
+        preview = f"보낼 말: {plan.text}" + (f" (행동: {plan.behaviour})" if plan.behaviour else "")
+        self.say(preview)
+        if judgment.normalized:
+            self.say("입력한 문구가 정규화되어 위 내용으로 보내져요.")
+        self.say("다른 플레이어에게 보이는 게임 채팅이에요.")
+
+        duplicate_confirmed = False
+        if self._service.needs_duplicate_confirm(plan.text):
+            if not _is_yes(self._ask(Q2)):
+                self.say("취소했어요. 게임 채팅창을 먼저 확인해주세요.")
+                return 7
+            try:
+                self._service.acknowledge_previous()
+            except StoreError:
+                self.say("확인 기록을 저장하지 못해 전송하지 않았어요.")
+                return 1
+            duplicate_confirmed = True
+
+        if not _is_yes(self._ask(Q1)):
+            self.say("취소했어요.")
+            return 2
+
+        # input()은 타이핑과 붙여넣기를 구분하지 못하므로 확인을 거친 PASTED로 처리한다(05 §4.10).
+        result = self._service.send_chat_action(
+            judgment,
+            origin=Origin.USER_AT,
+            provenance=Provenance.PASTED,
+            paste_confirmed=True,
+            duplicate_confirmed=duplicate_confirmed,
+        )
+        return self._report(result, plan.text, plan.behaviour)
+
+    def _report(self, result: ChatResult, text: str, behaviour: Optional[str]) -> int:
+        if result.store_warning:
+            self.say("작업 기록을 저장하지 못했어요. 다음 실행의 재전송 확인이 정확하지 않을 수 있어요.")
+        if result.status == ChatStatus.REFUSED:
+            self.say(f"보내지 않았어요: {result.detail}")
+            return 2
+        if result.status == ChatStatus.NEEDS_DUPLICATE_CONFIRM:
+            self.say("재전송 확인이 필요해요. 보내지 않았어요.")
+            return 7
+        if result.status == ChatStatus.BUSY:
+            self.say("다른 전송이 진행 중이라 보내지 않았어요.")
+            return 1
+        if result.status in (ChatStatus.STORE_FAILED, ChatStatus.INVALID_INPUT):
+            self.say(result.detail or "보내지 않았어요.")
+            return 1
+
+        outcome = result.outcome
+        if outcome == Outcome.COMPLETED:
+            suffix = f" + {behaviour}" if behaviour else ""
+            self.say(f"전송 완료: {text}{suffix}")
             return 0
+        if outcome == Outcome.PARTIAL:
+            if result.behaviour_resend_allowed:
+                self.say("채팅은 보냈고 행동만 실패했어요. 채팅은 다시 보내지 않아요.")
+            else:
+                self.say("채팅은 보냈어요. 행동은 됐는지 알 수 없어요.")
+            return 5
+        if outcome == Outcome.FAILED:
+            self.say("채팅을 보내지 못했어요.")
+            return 4
+        if result.reason == Reason.NO_KNOWN_RESPONSES:
+            self.say(MSG_UNKNOWN_NO_SAMPLES)
+        else:
+            self.say(MSG_UNKNOWN)
+        return 3
 
-        if line.strip().lower() in {"exit", "quit"}:
-            return 0
+    def run_interactive(self) -> int:
+        self.say("게임 채팅 도구입니다. @@ 뒤에 문구를 입력하세요. 종료: exit 또는 quit")
+        while True:
+            try:
+                line = input("> ")
+            except (EOFError, KeyboardInterrupt):
+                self.say("\n종료합니다.")
+                return 0
+            if line.strip().lower() in {"exit", "quit"}:
+                return 0
+            self.handle_line(line)
 
-        try:
-            message = parse_chat_input(line)
-            if message is None:
-                print("형식: @@ 보낼 문구")
-                continue
-            plan = send_decorated_chat(message)
-            suffix = f" + {plan.behaviour}" if plan.behaviour else ""
-            print(f"전송 완료: {plan.text}{suffix}")
-        except (ValueError, RuntimeError) as error:
-            print(f"오류: {error}")
+
+def _stdin_is_terminal() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def build_tool() -> Optional[Tool]:
+    try:
+        path = locate_cli()
+    except CliNotFound as error:
+        safe_print(f"오류: {error}", sys.stderr)
+        return None
+    known, problem = load_known_responses()
+    if problem:
+        safe_print(f"알림: {problem} 모든 전송이 확인 불가로 안내돼요.", sys.stderr)
+    store = ActionStore()
+    store.close_orphans()
+    service = ChatService(CommandBroker(adapter_for(path)), store, known)
+    return Tool(service)
 
 
 def main(argv: list[str]) -> int:
+    if not _stdin_is_terminal():
+        safe_print(
+            "터미널에서 직접 실행해야 해요. 스크립트나 파이프로는 채팅을 보내지 않아요.",
+            sys.stderr,
+        )
+        return 6
+    tool = build_tool()
+    if tool is None:
+        return 1
     if argv:
-        try:
-            message = parse_chat_input(" ".join(argv))
-            if message is None:
-                raise ValueError("명령행에서도 @@ 보낼 문구 형식을 사용하세요.")
-            plan = send_decorated_chat(message)
-            suffix = f" + {plan.behaviour}" if plan.behaviour else ""
-            print(f"전송 완료: {plan.text}{suffix}")
-            return 0
-        except (ValueError, RuntimeError) as error:
-            print(f"오류: {error}", file=sys.stderr)
-            return 1
-    return run_interactive()
+        return tool.handle_line(" ".join(argv))
+    return tool.run_interactive()
 
 
 if __name__ == "__main__":
