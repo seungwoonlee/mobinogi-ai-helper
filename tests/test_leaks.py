@@ -100,7 +100,7 @@ class LeakTests(FakeCliTestCase):
                 # 모든 변형(Base64·이스케이프 등), 응답 원문은 나오면 안 된다.
                 self._assert_clean(printed, "표준 출력", allow_plain=True)
                 for line in printed.splitlines():
-                    if CANARY in line:
+                    if any(needle in line for needle in (CANARY, CANARY[:6], SENT_TEXT)):
                         self.assertTrue(line.startswith("보낼 말:"), f"미리보기 밖에 문구가 있어요: {line!r}")
                 self._assert_clean(logs, "로그 레코드")
                 self._assert_clean(self.stored_text(), "저장 파일")

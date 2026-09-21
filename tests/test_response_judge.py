@@ -69,6 +69,7 @@ class JudgeTests(unittest.TestCase):
         cases = [
             body(status="ok", error="x"),
             body(status="ok", retryAfterSeconds=3),
+            body(status="ok", retryAfterSeconds=0),  # 0은 파이썬에서 False와 같아 "마커 없음"으로 오판되기 쉽다
             body(status="ok", body={"error": "x"}),
             body(status="blocked"),
             body(status="timeout"),
@@ -82,6 +83,11 @@ class JudgeTests(unittest.TestCase):
     def test_retry_after_is_reported_not_retried(self):
         verdict = judge_write_chat(raw(body(status="ok", retryAfterSeconds=7)), KNOWN_FIXTURE)
         self.assertEqual(verdict.retry_after, 7.0)
+        self.assertEqual(verdict.kind, VerdictKind.UNKNOWN)
+
+    def test_retry_after_zero_is_still_a_marker(self):
+        verdict = judge_write_chat(raw(body(status="ok", retryAfterSeconds=0)), KNOWN_FIXTURE)
+        self.assertEqual(verdict.retry_after, 0.0)
         self.assertEqual(verdict.kind, VerdictKind.UNKNOWN)
 
     def test_non_string_status_is_unknown_without_type_error(self):
@@ -115,6 +121,13 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(judge_write_chat(raw(""), KNOWN_FIXTURE).reason, Reason.EMPTY_RESPONSE)
         self.assertEqual(judge_write_chat(raw("{"), KNOWN_FIXTURE).reason, Reason.JSON_ERROR)
 
+    def test_deeply_nested_json_is_json_error_not_a_crash(self):
+        # json.loads는 1000단계 넘게 중첩되면 ValueError가 아니라 RecursionError를 던진다.
+        # 1MiB 출력 상한에 한참 못 미치는 입력으로도 트리거된다.
+        verdict = judge_write_chat(raw("[" * 5000), KNOWN_FIXTURE)
+        self.assertEqual(verdict.kind, VerdictKind.UNKNOWN)
+        self.assertEqual(verdict.reason, Reason.JSON_ERROR)
+
 
 class ConfigTests(unittest.TestCase):
     def _load(self, text):
@@ -145,9 +158,12 @@ class ConfigTests(unittest.TestCase):
                 self.assertIsNotNone(problem)
 
     def test_shipped_config_is_empty_and_unverified(self):
-        known, problem = load_known_responses()
+        # 저장소의 실제 config/known_responses.json을 읽지 않는다. 사용자가 표본을 채우면
+        # 그 파일 내용이 바뀌므로, 여기서는 출고 시 형식과 같은 고정 픽스처로 검사한다.
+        shipped = json.dumps({"schema": 1, "config_verified": False, "sent_statuses": [], "rejected_statuses": []})
+        known, problem = self._load(shipped)
         self.assertIsNone(problem)
-        self.assertFalse(known.usable)  # 출고 상태: 사용자가 표본을 채우기 전까지 비어 있다
+        self.assertFalse(known.usable)
 
 
 class CatalogTests(unittest.TestCase):

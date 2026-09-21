@@ -27,7 +27,7 @@ def parse_json(raw: RawResult) -> Parsed:
     failed = False
     try:
         decoded = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         failed = True
     if failed:
         # except 블록 밖: 디코딩 예외의 doc(원문)를 보관하지 않는다.
@@ -94,8 +94,13 @@ def find_markers(data: Any, key: str) -> list:
 
 
 def find_marker(data: Any, key: str) -> Optional[Any]:
-    """비어 있지 않은 첫 값을 돌려준다. 없으면 None."""
+    """비어 있지 않은 첫 값을 돌려준다. 없으면 None.
+
+    `in (None, "", False)`는 파이썬에서 `0 == False`라 `retryAfterSeconds: 0`
+    같은 값을 "마커 없음"으로 잘못 취급한다. `is`·`==`를 값 종류별로 나눠 비교한다.
+    """
     for value in find_markers(data, key):
-        if value not in (None, "", False):
-            return value
+        if value is None or value == "" or value is False:
+            continue
+        return value
     return None

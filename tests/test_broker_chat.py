@@ -334,12 +334,15 @@ class ChatPathInjectionTests(FakeCliTestCase):
         from unittest import mock
 
         self.scenario(delay=5, stdout=SENT)
-        calls = {"n": 0}
         real_sleep = time.sleep
+        fired = {"done": False}
 
         def interrupting(seconds):
-            calls["n"] += 1
-            if calls["n"] == 3:
+            # 고정 횟수 대신 모의 CLI가 실제로 호출을 기록했는지로 판단한다(환경마다 프로세스
+            # 기동 속도가 달라 고정 횟수로는 비결정적이었다). 이 패치는 time.sleep 전역에 걸리므로
+            # (정리 단계의 proc.wait()도 거친다) 한 번만 발동시킨다.
+            if not fired["done"] and len(self.calls()) >= 1:
+                fired["done"] = True
                 raise KeyboardInterrupt
             real_sleep(seconds)
 
@@ -357,7 +360,8 @@ class FuzzTests(FakeCliTestCase):
         rng = random.Random(20260921)
         pieces = [
             "", "{", "[]", "[1,2]", "null", '{"status": 1}', '{"status": "weird"}', '{"status": "ok", "error": "x"}',
-            '{"status": "ok", "retryAfterSeconds": 5}', '{"body": {"error": "x"}}', "��", "x" * 3000,
+            '{"status": "ok", "retryAfterSeconds": 5}', '{"status": "ok", "retryAfterSeconds": 0}',
+            '{"body": {"error": "x"}}', "��", "x" * 3000, "[" * 5000,
         ]
         empty_known = KnownResponses()
         for iteration in range(200):
